@@ -12,7 +12,7 @@ Everything in the panel runs in your browser on your own machine. The passphrase
 
 ## Opening it
 
-1. Start NetPane the normal way. On Linux that is `sudo python3 netpane.py`, which opens the page at `http://127.0.0.1:8765`.
+1. Start NetPane the normal way. On Linux that is `sudo python3 NetPane.py`, which opens the page at `http://127.0.0.1:8765`.
 2. In the left sidebar, click **Wi-Fi Audit**, or press Ctrl+9.
 
 The nearby-networks list needs `nmcli` (the NetworkManager CLI) to read Wi-Fi. Most desktop Linux installs already have it. If NetPane says to install network-manager, the passphrase tester and the list check still work without it, because those two are pure client-side and do not depend on a scan.
