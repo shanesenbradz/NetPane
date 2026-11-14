@@ -10,21 +10,21 @@ It is one Python file. On Linux it needs only the standard library, so there is 
 
 ## Quick start on Windows
 
-1. Download `NetPane.exe` from the [latest release](https://github.com/shanesenbradz/netpane/releases/latest).
+1. Download `NetPane.exe` from the [latest release](https://github.com/shanesenbradz/NetPane/releases/latest).
 2. Double-click it. A small console window opens and your browser goes to `http://127.0.0.1:8765`.
 3. Close that console window when you're done.
 
 For the full picture (every program name on the Apps page), right-click `NetPane.exe` and choose **Run as administrator**.
 
-Windows SmartScreen may warn you the first time, because the exe isn't code-signed. Click **More info**, then **Run anyway**. If you'd rather not trust a downloaded exe, run the same file with Python instead: `pip install psutil`, then `python netpane.py`.
+Windows SmartScreen may warn you the first time, because the exe isn't code-signed. Click **More info**, then **Run anyway**. If you'd rather not trust a downloaded exe, run the same file with Python instead: `pip install psutil`, then `python NetPane.py`.
 
 On Windows, NetPane uses the tools that come with Windows (`ping`, `tracert`, `pathping`, `ipconfig`, `netsh`, `arp`, `route`, `netstat`, `nslookup`) plus PowerShell, so there's nothing else to install. If you also have Nmap or Wireshark, it picks them up for faster device scans and packet capture.
 
 ## Quick start on Linux
 
 ```bash
-curl -LO https://raw.githubusercontent.com/shanesenbradz/netpane/main/netpane.py
-sudo python3 netpane.py
+curl -LO https://raw.githubusercontent.com/shanesenbradz/NetPane/main/NetPane.py
+sudo python3 NetPane.py
 ```
 
 NetPane opens in its own window, without tabs or an address bar, if you have Brave, Chrome, Chromium, Edge or Vivaldi. Otherwise it opens a normal browser tab. Closing the window stops NetPane. Press **Run checks** (or Ctrl+R) any time to test again.
@@ -34,7 +34,7 @@ Running with `sudo` is optional. Without it you still get most of the picture, b
 To add NetPane to your applications menu, run this once (without sudo):
 
 ```bash
-python3 netpane.py --install
+python3 NetPane.py --install
 ```
 
 It then shows up like any other app. Right-click it and choose **Run with full access** to start it as root through your desktop's normal password prompt. `--uninstall` removes it again.
@@ -42,7 +42,7 @@ It then shows up like any other app. Right-click it and choose **Run with full a
 No browser on the box (a server over SSH)? Print the full report to the terminal instead:
 
 ```bash
-sudo python3 netpane.py --report
+sudo python3 NetPane.py --report
 ```
 
 ## What it checks
@@ -66,6 +66,7 @@ Some judgement is built in so you don't chase false alarms. A gateway that ignor
 - **Traffic**: live download and upload graph per interface, plus `vnstat` history if you have it.
 - **Apps**: every program on this computer with a network connection open, with its PIDs, user, connection count, listening ports, live download and upload speed, and the server it's talking to most. Switch between one row per app (Brave's many processes grouped together) and one row per PID. Click a program to see every connection it holds, with the remote server's name. Right-click to copy PIDs.
 - **Interfaces**: addresses, speeds, error counters, routing table, DNS settings, Wi-Fi and nearby networks. The VLAN card shows any 802.1Q tag this host carries, and whether the segment reaches the gateway and the internet. On an access port the switch strips the tag, so press **Listen for a switch** to learn the port or native VLAN from an LLDP or CDP advertisement (needs root, or lldpd installed).
+- **Adapters**: click any network card or Wi-Fi card on the Interfaces page to see what it actually is. You get the chip maker and model, the card maker, the PCI or USB hardware ID, how it connects (PCIe lane and speed, or USB generation), slot, revision, driver, driver version and firmware. MAC addresses show both the one in use and the one burned into the card, so a randomised Wi-Fi MAC doesn't throw you off. Wi-Fi cards also list their generation (Wi-Fi 4 to 7), 802.11 standards, bands, antenna count, radio switch state and supported modes. Ethernet cards list their max link speed, supported link modes and Wake-on-LAN. From the same panel you can turn the adapter off and on again, which is often the quickest fix for a stuck card (needs sudo on Linux, administrator on Windows). If the card is dead, the **Buying a replacement** box sums up what to look for and copies the spec or a search term in one click.
 - **Tools**: a console for all 30 underlying tools with example commands. It adds safe limits automatically (packet counts, report mode, time limits) so nothing runs forever.
 - **Lookups**: passive, read-only intel on a domain, IP or host. DNS records with SPF and DMARC posture, WHOIS and RDAP, a TLS certificate inspector with expiry, ASN and BGP origin, and a public-exposure check (open ports and known CVEs) via Shodan's keyless InternetDB. Everything is a normal public query and nothing here touches the target beyond that.
 - **Report**: downloads a plain-text report you can paste into a ticket or send to your ISP.
@@ -85,7 +86,7 @@ For TCP, NetPane reads the kernel's own byte counters for each connection (`ss -
 | `/` or Ctrl+F | Jump to the page's filter or search box |
 | Up and Down | Move through table rows |
 | Enter | Open the selected row |
-| Shift+F10 or right-click | Row menu: copy PID, copy IP, ping, scan, trace |
+| Shift+F10 or right-click | Row menu: copy PID, copy IP, ping, scan, trace, turn an adapter on or off |
 | Ctrl+S | Save the text report |
 | Esc | Close panels and menus |
 | `?` | Show these shortcuts |
@@ -108,8 +109,8 @@ sudo apt install -y fping mtr-tiny traceroute dnsutils nmap ethtool arping iw \
 ## Options
 
 ```
-sudo python3 netpane.py [--port 8765] [--bind 127.0.0.1] [--no-browser] [--tab] [--keep-running] [--report]
-python3 netpane.py --install | --uninstall
+sudo python3 NetPane.py [--port 8765] [--bind 127.0.0.1] [--no-browser] [--tab] [--keep-running] [--report]
+python3 NetPane.py --install | --uninstall
 NetPane.exe [--port 8765] [--bind 127.0.0.1] [--no-browser] [--report]
 ```
 
@@ -151,7 +152,7 @@ Every push to this repo builds `NetPane.exe` on a Windows machine through GitHub
 
 ```
 pip install pyinstaller psutil
-pyinstaller --onefile --console --name NetPane --icon packaging/netpane.ico --version-file packaging/version.txt netpane.py
+pyinstaller --onefile --console --name NetPane --icon packaging/NetPane.ico --version-file packaging/version.txt NetPane.py
 ```
 
 The exe lands in `dist\NetPane.exe`.

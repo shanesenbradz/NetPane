@@ -1,8 +1,8 @@
 __pycache__/
 *.pyc
-netpane-*.txt
-netpane-*.json
-netpane-smoke.log
+NetPane-*.txt
+NetPane-*.json
+NetPane-smoke.log
 build/
 dist/
 *.spec

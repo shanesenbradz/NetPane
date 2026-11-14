@@ -2,8 +2,8 @@
 """
 NetPane: a single pane of glass for Linux network troubleshooting.
 
-Linux:       sudo python3 netpane.py
-Windows:     NetPane.exe   (or: python netpane.py, after pip install psutil)
+Linux:       sudo python3 NetPane.py
+Windows:     NetPane.exe   (or: python NetPane.py, after pip install psutil)
 Then open:   http://127.0.0.1:8765   (opens automatically)
 
 On Linux only the standard library is needed; root unlocks arping, tcpdump,
@@ -46,7 +46,7 @@ try:
 except ImportError:  # optional on Linux, bundled in the Windows exe
     psutil = None
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 IS_WIN = os.name == "nt"
 PLATFORM = "windows" if IS_WIN else "linux"
 
@@ -597,7 +597,7 @@ def interfaces_win():
             "flags": ["LOOPBACK"] if lo else [], "carrier": None if lo else ("1" if up else "0"),
             "speed": (st.speed or None) if st else None, "duplex": duplex, "driver": desc or None,
             "wireless": wireless, "virtual": a.get("HardwareInterface") is False or (not a and not lo),
-            "loopback": lo, "ipv4": v4, "ipv6": v6,
+            "loopback": lo, "enabled": str(a.get("Status") or "") != "Disabled", "ipv4": v4, "ipv6": v6,
             "rx_bytes": c.bytes_recv if c else None, "tx_bytes": c.bytes_sent if c else None,
             "rx_errors": c.errin if c else 0, "tx_errors": c.errout if c else 0,
             "rx_dropped": c.dropin if c else 0, "tx_dropped": c.dropout if c else 0,
@@ -608,6 +608,21 @@ def interfaces_win():
                 wl = wifi_links_win()
             item["wifi"] = wl.get(name, {"connected": False})
         out.append(item)
+    # adapters that are turned off vanish from psutil, so add them back from Get-NetAdapter
+    for name, a in ad.items():
+        if not name or name in addrs:
+            continue
+        desc = str(a.get("InterfaceDescription") or "")
+        mac = str(a.get("MacAddress") or "").replace("-", ":").lower()
+        wireless = "802.11" in str(a.get("Media") or "") or bool(re.search(r"wi-?fi|wireless|wlan|802\.11", desc + " " + name, re.I))
+        out.append({
+            "name": name, "state": "DOWN", "mac": mac, "mtu": None, "flags": [], "carrier": "0",
+            "speed": None, "duplex": None, "driver": desc or None, "wireless": wireless,
+            "virtual": a.get("HardwareInterface") is False, "loopback": False,
+            "enabled": str(a.get("Status") or "") != "Disabled", "ipv4": [], "ipv6": [],
+            "rx_bytes": None, "tx_bytes": None, "rx_errors": 0, "tx_errors": 0, "rx_dropped": 0, "tx_dropped": 0,
+            "vendor": vendor(mac), **({"wifi": {"connected": False}} if wireless else {}),
+        })
     return out
 
 
@@ -812,6 +827,7 @@ def interfaces():
             "speed": speed if speed > 0 else None, "duplex": read(f"{base}/duplex"), "driver": driver,
             "wireless": os.path.isdir(f"{base}/wireless") or os.path.exists(f"{base}/phy80211"),
             "virtual": not os.path.exists(f"{base}/device"), "loopback": "LOOPBACK" in flags,
+            "enabled": "UP" in flags,
             "ipv4": [f'{i["local"]}/{i["prefixlen"]}' for i in a.get("addr_info", []) if i.get("family") == "inet"],
             "ipv6": [f'{i["local"]}/{i["prefixlen"]}' for i in a.get("addr_info", []) if i.get("family") == "inet6"],
             "rx_bytes": rx.get("bytes"), "tx_bytes": tx.get("bytes"),
@@ -823,6 +839,496 @@ def interfaces():
             item["wifi"] = wifi_link(name)
         out.append(item)
     return out
+
+
+# --------------------------------------------------------------------------
+# adapter (NIC / WIC) hardware details and on/off
+# --------------------------------------------------------------------------
+def _strip_id(v):
+    """'Intel Corporation [8086]' -> ('Intel Corporation', '8086')"""
+    m = re.match(r"(.*?)\s*\[([0-9a-fA-F]{4})\]\s*$", v or "")
+    return (m.group(1).strip(), m.group(2).lower()) if m else ((v or "").strip(), "")
+
+
+def _kv_colon(text):
+    d = {}
+    for line in text.splitlines():
+        k, sep, v = line.partition(":")
+        if sep and k.strip() and not k.startswith((" ", "\t")):
+            d[k.strip()] = v.strip()
+    return d
+
+
+def _wifi_gen(standards):
+    for std, gen in (("802.11be", "Wi-Fi 7"), ("802.11ax", "Wi-Fi 6"), ("802.11ac", "Wi-Fi 5"), ("802.11n", "Wi-Fi 4")):
+        if std in standards:
+            return gen
+    return ""
+
+
+def _eth_max(modes):
+    best = 0
+    for m in modes:
+        g = re.match(r"(\d+)base", m)
+        if g:
+            best = max(best, int(g.group(1)))
+    if not best:
+        return ""
+    return f"{best / 1000:g} Gb/s" if best >= 1000 else f"{best} Mb/s"
+
+
+def _ids_lookup(kind, vid, pid):
+    """Vendor and device names from pci.ids / usb.ids when lspci or udevadm aren't installed."""
+    for path in (f"/usr/share/hwdata/{kind}.ids", f"/usr/share/misc/{kind}.ids", f"/usr/share/{kind}.ids"):
+        try:
+            with open(path, errors="replace") as f:
+                vname = None
+                for line in f:
+                    if vname is None:
+                        if line[:4].lower() == vid and line[4:6] == "  ":
+                            vname = line[6:].strip()
+                    elif line.startswith("\t") and not line.startswith("\t\t"):
+                        if line[1:5].lower() == pid:
+                            return vname, line[7:].strip()
+                    elif line.strip() and not line.startswith(("\t", "#")):
+                        return vname, None
+                if vname:
+                    return vname, None
+        except OSError:
+            continue
+    return None, None
+
+
+def _nic_names():
+    if IS_WIN:
+        names = {a.get("Name") for a in win_snapshot()["adapters"] if a.get("Name")}
+        if psutil:
+            names |= set(psutil.net_if_addrs())
+        return names
+    try:
+        return set(os.listdir("/sys/class/net"))
+    except OSError:
+        return set()
+
+
+def _shopping(d):
+    """A short spec and a search term for buying the same or a compatible card."""
+    hw, cap = d.get("hardware", {}), d.get("capabilities", {})
+    chip = " ".join(x for x in (hw.get("chip_vendor"), hw.get("chip_model")) if x).strip()
+    kind = "Wi-Fi" if d.get("wireless") else "software adapter" if d.get("virtual") or d.get("loopback") else "Ethernet"
+    lines = [f"Adapter: {d.get('name')} ({kind})"]
+    for label, key in (("Chipset", None), ("Card maker", "card_vendor"), ("Card model", "card_model"),
+                       ("Hardware ID", "hardware_id"), ("Connection", "bus"), ("Slot / location", "location"),
+                       ("Revision", "revision"), ("Serial", "serial")):
+        val = chip if key is None else hw.get(key)
+        if val:
+            lines.append(f"{label}: {val}")
+    for label, key in (("Wi-Fi generation", "generation"), ("Standards", "standards"), ("Bands", "bands"),
+                       ("Antennas / streams", "streams"), ("Max link speed", "max_speed"), ("Port", "port")):
+        val = cap.get(key)
+        if isinstance(val, list):
+            val = ", ".join(val)
+        if val:
+            lines.append(f"{label}: {val}")
+    drv = d.get("driver", {})
+    if drv.get("name"):
+        lines.append("Driver: " + " ".join(x for x in (drv.get("name"), drv.get("version")) if x))
+    if drv.get("firmware"):
+        lines.append(f"Firmware: {drv['firmware']}")
+    if d.get("permanent_mac") or d.get("mac"):
+        lines.append(f"MAC address: {d.get('permanent_mac') or d.get('mac')}")
+    term = chip or hw.get("description") or ""
+    mid = re.search(r"[0-9a-f]{4}:[0-9a-f]{4}", hw.get("hardware_id", ""))
+    if mid and term:
+        term += " " + mid.group(0)
+    tips = []
+    bus = (hw.get("bus") or "").lower()
+    if d.get("wireless"):
+        if "usb" in bus:
+            tips.append("This is a USB adapter. Any USB Wi-Fi adapter with a driver for your OS will replace it.")
+        elif "pci" in bus:
+            tips.append("This is an internal card (PCIe, usually M.2 or mini PCIe). Match the slot type and key "
+                        "(M.2 A+E key is common for Wi-Fi), and check the laptop has no BIOS whitelist for Wi-Fi cards.")
+        if cap.get("generation"):
+            tips.append(f"Buy {cap['generation']} or newer to keep at least the same speed and bands.")
+        tips.append("Move the antenna leads (usually 2 small coax plugs) to the new card.")
+    else:
+        if "usb" in bus:
+            tips.append("This is a USB Ethernet adapter. Match or beat the max link speed and the USB generation.")
+        elif "pci" in bus:
+            tips.append("Built-in or PCIe Ethernet. If it is on the motherboard, a PCIe or USB Ethernet adapter "
+                        "with the same max link speed is the usual fix.")
+    return {"spec": "\n".join(lines), "search": term, "tips": tips}
+
+
+def nic_details_linux(name):
+    base = f"/sys/class/net/{name}"
+    me = next((i for i in interfaces() if i["name"] == name), {})
+    d = {"name": name, "wireless": bool(me.get("wireless")), "virtual": bool(me.get("virtual")),
+         "loopback": bool(me.get("loopback")), "state": me.get("state"), "enabled": me.get("enabled"),
+         "mac": me.get("mac"), "mac_vendor": me.get("vendor"), "mtu": me.get("mtu"),
+         "ipv4": me.get("ipv4", []), "ipv6": me.get("ipv6", []), "carrier": me.get("carrier"),
+         "hardware": {}, "driver": {}, "capabilities": {}, "raw": {}}
+    hw, drv, cap, raw = d["hardware"], d["driver"], d["capabilities"], d["raw"]
+    if not me:  # `ip` missing or failed: read the basics straight from sysfs
+        try:
+            fl = int(read(f"{base}/flags", "0x0"), 16)
+        except ValueError:
+            fl = 0
+        d.update(mac=read(f"{base}/address"), mtu=read(f"{base}/mtu"), state=(read(f"{base}/operstate") or "").upper(),
+                 enabled=bool(fl & 1), loopback=bool(fl & 8) or read(f"{base}/type") == "772",
+                 wireless=os.path.isdir(f"{base}/wireless") or os.path.exists(f"{base}/phy80211"),
+                 virtual=not os.path.exists(f"{base}/device"), carrier=read(f"{base}/carrier"))
+        d["mac_vendor"] = "" if d["loopback"] else vendor(d["mac"] or "")
+    dev = os.path.realpath(f"{base}/device") if os.path.exists(f"{base}/device") else ""
+    pci = dev
+    while pci and pci != "/" and not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]", os.path.basename(pci)):
+        pci = os.path.dirname(pci)
+    pci = pci if pci and pci != "/" else ""
+    hw["sysfs_path"] = dev or None
+    assign = read(f"{base}/addr_assign_type")
+    if assign and assign != "0":
+        d["mac_note"] = {"1": "random", "2": "stolen from another device", "3": "set by software"}.get(assign, "changed")
+    # ethtool
+    if have("ethtool"):
+        r = run(["ethtool", "-i", name], 5)
+        if r["ok"]:
+            raw["ethtool -i"] = r["out"].strip()
+            k = _kv_colon(r["out"])
+            drv.update(name=k.get("driver") or None, version=k.get("version") or None,
+                       firmware=k.get("firmware-version") or None)
+            if k.get("bus-info") and k["bus-info"] != "N/A":
+                hw["location"] = k["bus-info"]
+        r = run(["ethtool", "-P", name], 5)
+        m = re.search(r"([0-9a-f]{2}(?::[0-9a-f]{2}){5})", r["out"].lower())
+        if m and m.group(1) != "00:00:00:00:00:00":
+            d["permanent_mac"] = m.group(1)
+            d["permanent_mac_vendor"] = vendor(m.group(1))
+        if not d["wireless"]:
+            r = run(["ethtool", name], 5)
+            if r["out"].strip():
+                raw["ethtool"] = r["out"].strip()
+                txt = r["out"]
+                sm = re.search(r"Supported link modes:(.*?)(?:\n\s*Supported pause|\n\s*Supported FEC|\n\s*Supports auto)", txt, re.S)
+                modes = sm.group(1).split() if sm else []
+                if modes and modes != ["Not", "reported"]:
+                    cap["link_modes"] = modes
+                    cap["max_speed"] = _eth_max(modes)
+                for key, pat in (("port", r"Port: (.+)"), ("autoneg", r"Auto-negotiation: (.+)"),
+                                 ("current_speed", r"Speed: (.+)"), ("current_duplex", r"Duplex: (.+)"),
+                                 ("link_detected", r"Link detected: (.+)"), ("wake_on_lan", r"\n\s*Wake-on: (.+)")):
+                    g = re.search(pat, txt)
+                    if g and not g.group(1).startswith("Unknown"):
+                        cap[key] = g.group(1).strip()
+    if not drv.get("name") and os.path.exists(f"{base}/device/driver"):
+        drv["name"] = os.path.basename(os.path.realpath(f"{base}/device/driver"))
+    if drv.get("name") and not drv.get("version"):
+        drv["version"] = read(f"/sys/module/{drv['name']}/version")
+    # bus: PCI, USB, SDIO or platform
+    if "/usb" in dev:
+        hw["bus"] = "USB"
+        p = dev
+        while p and p != "/" and not os.path.exists(f"{p}/idVendor"):
+            p = os.path.dirname(p)
+        if os.path.exists(f"{p}/idVendor"):
+            vid, pid = read(f"{p}/idVendor", ""), read(f"{p}/idProduct", "")
+            hw["hardware_id"] = f"USB {vid}:{pid}"
+            hw["chip_vendor"] = read(f"{p}/manufacturer")
+            hw["chip_model"] = read(f"{p}/product")
+            hw["serial"] = read(f"{p}/serial")
+            spd = read(f"{p}/speed")
+            if spd:
+                gen = {"480": "USB 2.0", "5000": "USB 3.0", "10000": "USB 3.1/3.2", "20000": "USB 3.2 2x2"}.get(spd, "")
+                hw["bus"] = f"USB ({gen + ', ' if gen else ''}{spd} Mb/s port)"
+            hw["revision"] = read(f"{p}/bcdDevice")
+            if have("lsusb") and vid:
+                r = run(["lsusb", "-d", f"{vid}:{pid}"], 5)
+                m = re.search(r"ID [0-9a-f]{4}:[0-9a-f]{4} (.+)", r["out"])
+                if m:
+                    hw["description"] = m.group(1).strip()
+    elif pci and os.path.exists(f"{pci}/vendor"):
+        hw["bus"] = "PCIe"
+        h = lambda f: (read(f"{pci}/{f}", "") or "").replace("0x", "")
+        vid, pid, svid, spid = h("vendor"), h("device"), h("subsystem_vendor"), h("subsystem_device")
+        hw["hardware_id"] = f"PCI {vid}:{pid}" + (f"  subsystem {svid}:{spid}" if svid else "")
+        hw["revision"] = h("revision") or None
+        slot = os.path.basename(pci)
+        hw["location"] = hw.get("location") if hw.get("location", "").count(":") == 2 else slot
+        if have("lspci"):
+            r = run(["lspci", "-vmm", "-nn", "-s", slot], 5)
+            raw["lspci"] = r["out"].strip()
+            k = {}
+            for line in r["out"].splitlines():
+                a, _, b = line.partition(":")
+                k[a.strip()] = b.strip()
+            hw["chip_vendor"] = _strip_id(k.get("Vendor"))[0] or None
+            hw["chip_model"] = _strip_id(k.get("Device"))[0] or None
+            hw["card_vendor"] = _strip_id(k.get("SVendor"))[0] or None
+            hw["card_model"] = _strip_id(k.get("SDevice"))[0] or None
+            if k.get("Rev"):
+                hw["revision"] = k["Rev"]
+            r = run(["lspci", "-vv", "-s", slot], 5)
+            m = re.search(r"LnkSta:\s*Speed ([^,]+), Width (x\d+)", r["out"])
+            if m:
+                hw["bus"] = f"PCIe ({m.group(2)} at {m.group(1).strip()})"
+    elif "/sdio" in dev or "mmc" in dev:
+        hw["bus"] = "SDIO (soldered on the board)"
+    elif dev:
+        hw["bus"] = "Built into the system board (platform device)"
+    else:
+        hw["bus"] = "None. This is a software (virtual) adapter"
+    m = re.match(r"(PCI|USB) ([0-9a-f]{4}):([0-9a-f]{4})", hw.get("hardware_id", ""))
+    if m and not (hw.get("chip_vendor") and hw.get("chip_model")):
+        vn, dn = _ids_lookup(m.group(1).lower(), m.group(2), m.group(3))
+        hw["chip_vendor"] = hw.get("chip_vendor") or vn
+        hw["chip_model"] = hw.get("chip_model") or dn
+    # udev fills the gaps from its hardware database
+    if have("udevadm"):
+        r = run(["udevadm", "info", "-q", "property", "-p", base], 5)
+        k = dict(l.split("=", 1) for l in r["out"].splitlines() if "=" in l)
+        hw["chip_vendor"] = hw.get("chip_vendor") or k.get("ID_VENDOR_FROM_DATABASE") or None
+        hw["chip_model"] = hw.get("chip_model") or k.get("ID_MODEL_FROM_DATABASE") or None
+        if k.get("ID_NET_NAME_PATH"):
+            hw["predictable_name"] = k["ID_NET_NAME_PATH"]
+    # Wi-Fi radio
+    if d["wireless"]:
+        phy = read(f"{base}/phy80211/name")
+        cap["radio"] = phy
+        rk = [x for x in (os.listdir(f"{base}/phy80211") if os.path.isdir(f"{base}/phy80211") else []) if x.startswith("rfkill")]
+        if rk:
+            rb = f"{base}/phy80211/{rk[0]}"
+            soft, hard = read(f"{rb}/soft") == "1", read(f"{rb}/hard") == "1"
+            d["rfkill"] = {"id": read(f"{rb}/index") or rk[0][6:], "soft": soft, "hard": hard}
+            cap["radio_switch"] = ("Blocked by a hardware switch or Fn key" if hard else
+                                   "Turned off in software (airplane mode or rfkill)" if soft else "On")
+        if have("iw") and phy:
+            r = run(["iw", "dev", name, "info"], 5)
+            raw["iw dev info"] = r["out"].strip()
+            for key, pat in (("mode", r"type (\S+)"), ("tx_power", r"txpower ([\d.]+ dBm)"), ("channel", r"channel (.+)")):
+                m = re.search(pat, r["out"])
+                if m:
+                    cap[key] = m.group(1).strip()
+            r = run(["iw", "phy", phy, "info"], 5)
+            txt = r["out"]
+            raw["iw phy info"] = txt.strip()[:12000]
+            freqs = [float(f) for f in re.findall(r"\*\s+(\d{4}(?:\.\d+)?) MHz \[\d+\](?! \(disabled\))", txt)]
+            bands = []
+            if any(2400 <= f < 2500 for f in freqs):
+                bands.append("2.4 GHz")
+            if any(5150 <= f < 5925 for f in freqs):
+                bands.append("5 GHz")
+            if any(5925 <= f <= 7125 for f in freqs):
+                bands.append("6 GHz")
+            cap["bands"] = bands
+            std = ["802.11b", "802.11g"] if "2.4 GHz" in bands else []
+            if "5 GHz" in bands:
+                std.append("802.11a")
+            if "HT20" in txt or "HT Capabilities" in txt:
+                std.append("802.11n")
+            if "VHT Capabilities" in txt:
+                std.append("802.11ac")
+            if "HE Iftypes" in txt or "HE PHY Capabilities" in txt:
+                std.append("802.11ax")
+            if "EHT Iftypes" in txt or "EHT PHY Capabilities" in txt:
+                std.append("802.11be")
+            cap["standards"] = std
+            cap["generation"] = _wifi_gen(std)
+            if cap["generation"] == "Wi-Fi 6" and "6 GHz" in bands:
+                cap["generation"] = "Wi-Fi 6E"
+            m = re.search(r"Available Antennas: TX 0x([0-9a-f]+) RX 0x([0-9a-f]+)", txt)
+            if m:
+                tx, rx = bin(int(m.group(1), 16)).count("1"), bin(int(m.group(2), 16)).count("1")
+                if tx and rx:
+                    cap["streams"] = f"{tx}x{rx} MIMO ({tx} antenna{'s' if tx > 1 else ''})"
+            m = re.search(r"Supported interface modes:\n((?:\s+\* .+\n)+)", txt)
+            if m:
+                cap["modes"] = [x.strip("* \t") for x in m.group(1).splitlines() if x.strip()]
+    hw["description"] = hw.get("description") or " ".join(
+        x for x in (hw.get("chip_vendor"), hw.get("chip_model")) if x) or None
+    return d
+
+
+PS_NIC = (
+    "$a=Get-NetAdapter -IncludeHidden | Where-Object {$_.Name -eq '__N__'} | Select-Object -First 1;"
+    "if(-not $a){'{}';return};"
+    "$o=[ordered]@{};"
+    "$o.adapter=$a | Select-Object Name,InterfaceDescription,MacAddress,PermanentAddress,LinkSpeed,MtuSize,"
+    "DriverProvider,DriverVersionString,DriverDate,DriverDescription,DriverFileName,ComponentID,PnPDeviceID,"
+    "HardwareInterface,Virtual,ifIndex,FullDuplex,"
+    "@{n='Status';e={[string]$_.Status}},@{n='AdminStatus';e={[string]$_.AdminStatus}},"
+    "@{n='MediaType';e={[string]$_.MediaType}},@{n='PhysicalMediaType';e={[string]$_.PhysicalMediaType}},"
+    "@{n='ConnectorPresent';e={$_.ConnectorPresent}};"
+    "if($a.PnPDeviceID){$p=Get-PnpDevice -InstanceId $a.PnPDeviceID;"
+    "$o.pnp=$p | Select-Object FriendlyName,Manufacturer,Class,HardwareID,@{n='Status';e={[string]$_.Status}};"
+    "$k=Get-PnpDeviceProperty -InstanceId $a.PnPDeviceID -KeyName DEVPKEY_Device_LocationInfo,"
+    "DEVPKEY_Device_BusReportedDeviceDesc,DEVPKEY_Device_EnumeratorName;"
+    "$o.props=@{};foreach($x in $k){$o.props[$x.KeyName]=[string]$x.Data}};"
+    "$o.adv=@(Get-NetAdapterAdvancedProperty -Name '__N__' | Select-Object DisplayName,DisplayValue);"
+    "$o | ConvertTo-Json -Depth 4 -Compress"
+)
+
+
+def nic_details_win(name):
+    me = next((i for i in interfaces() if i["name"] == name), {})
+    raw = powershell(PS_NIC.replace("__N__", name.replace("'", "''")), 40) or {}
+    a, p, props = raw.get("adapter") or {}, raw.get("pnp") or {}, raw.get("props") or {}
+    d = {"name": name, "wireless": bool(me.get("wireless")), "virtual": bool(me.get("virtual")),
+         "loopback": bool(me.get("loopback")), "state": me.get("state"), "enabled": me.get("enabled"),
+         "mac": me.get("mac"), "mac_vendor": me.get("vendor"), "mtu": me.get("mtu"),
+         "ipv4": me.get("ipv4", []), "ipv6": me.get("ipv6", []), "carrier": me.get("carrier"),
+         "hardware": {}, "driver": {}, "capabilities": {}, "raw": {}}
+    hw, drv, cap = d["hardware"], d["driver"], d["capabilities"]
+    perm = str(a.get("PermanentAddress") or "")
+    if re.fullmatch(r"[0-9A-Fa-f]{12}", perm):
+        perm = ":".join(perm[i:i + 2] for i in range(0, 12, 2)).lower()
+        d["permanent_mac"] = perm
+        d["permanent_mac_vendor"] = vendor(perm)
+        if d["mac"] and perm != d["mac"]:
+            d["mac_note"] = "random or set by software"
+    ids = as_list(p.get("HardwareID"))
+    hid = next((x for x in ids if re.search(r"VEN_|VID_", x, re.I)), ids[0] if ids else "")
+    m = re.search(r"VEN_([0-9A-F]{4})&DEV_([0-9A-F]{4})(?:&SUBSYS_([0-9A-F]{4})([0-9A-F]{4}))?(?:&REV_([0-9A-F]{2}))?", hid, re.I)
+    if m:
+        hw["bus"] = "PCIe"
+        hw["hardware_id"] = f"PCI {m.group(1).lower()}:{m.group(2).lower()}" + (
+            f"  subsystem {m.group(4).lower()}:{m.group(3).lower()}" if m.group(3) else "")
+        hw["revision"] = m.group(5)
+    m2 = re.search(r"VID_([0-9A-F]{4})&PID_([0-9A-F]{4})(?:&REV_([0-9A-F]{4}))?", hid, re.I)
+    if m2:
+        hw["bus"] = "USB"
+        hw["hardware_id"] = f"USB {m2.group(1).lower()}:{m2.group(2).lower()}"
+        hw["revision"] = m2.group(3)
+    enum = props.get("DEVPKEY_Device_EnumeratorName", "")
+    if not hw.get("bus"):
+        hw["bus"] = enum or ("None. This is a software (virtual) adapter" if d["virtual"] else None)
+    hw.update(description=a.get("InterfaceDescription") or p.get("FriendlyName"),
+              chip_vendor=p.get("Manufacturer") or None,
+              chip_model=props.get("DEVPKEY_Device_BusReportedDeviceDesc") or a.get("DriverDescription") or None,
+              location=props.get("DEVPKEY_Device_LocationInfo") or None,
+              device_id=a.get("PnPDeviceID") or None, all_ids=ids or None)
+    dd = str(a.get("DriverDate") or "")
+    drv.update(name=a.get("DriverFileName") or None, version=a.get("DriverVersionString") or None,
+               provider=a.get("DriverProvider") or None, date=dd[:10] or None)
+    cap.update(current_speed=a.get("LinkSpeed") or None, media=a.get("PhysicalMediaType") or a.get("MediaType") or None,
+               current_duplex=("full" if a.get("FullDuplex") else "half") if a.get("FullDuplex") is not None else None)
+    adv = {str(x.get("DisplayName")): str(x.get("DisplayValue")) for x in as_list(raw.get("adv")) if x.get("DisplayName")}
+    if adv:
+        d["raw"]["advanced properties"] = "\n".join(f"{k}: {v}" for k, v in adv.items())
+        sp = adv.get("Speed & Duplex") or adv.get("Link Speed")
+        if sp:
+            cap["speed_setting"] = sp
+        for k in ("Wireless Mode", "802.11n/ac/ax Wireless Mode", "Preferred Band", "Channel Width for 5GHz", "Wake on Magic Packet"):
+            if k in adv:
+                cap[k] = adv[k]
+    if d["wireless"]:
+        cur, block = None, {}
+        for line in run(["netsh", "wlan", "show", "drivers"], 10)["out"].splitlines():
+            k, sep, v = line.partition(":")
+            k = k.strip().lower()
+            if not sep:
+                continue
+            if k == "interface name":
+                cur = v.strip()
+                continue
+            if cur == name or cur is None:
+                block.setdefault(k, v.strip())
+        if block:
+            d["raw"]["netsh wlan show drivers"] = "\n".join(f"{k}: {v}" for k, v in block.items())
+            std = block.get("radio types supported", "").split()
+            cap["standards"] = std
+            cap["generation"] = _wifi_gen(std)
+            bands = []
+            if any(s in std for s in ("802.11b", "802.11g", "802.11n")):
+                bands.append("2.4 GHz")
+            if any(s in std for s in ("802.11a", "802.11ac")) or "5" in block.get("supported bands", ""):
+                bands.append("5 GHz")
+            if "6" in block.get("supported bands", ""):
+                bands.append("6 GHz")
+                if cap["generation"] == "Wi-Fi 6":
+                    cap["generation"] = "Wi-Fi 6E"
+            cap["bands"] = bands
+            hw["chip_vendor"] = hw.get("chip_vendor") or block.get("vendor")
+            drv["provider"] = drv.get("provider") or block.get("provider")
+    return d
+
+
+def nic_details(name):
+    if name not in _nic_names():
+        return {"error": f"No adapter called {name!r}."}
+    d = nic_details_win(name) if IS_WIN else nic_details_linux(name)
+    d["hardware"] = {k: v for k, v in d["hardware"].items() if v}
+    d["driver"] = {k: v for k, v in d["driver"].items() if v}
+    d["capabilities"] = {k: v for k, v in d["capabilities"].items() if v not in (None, "", [])}
+    d["replacement"] = _shopping(d)
+    d["can_toggle"] = IS_ROOT and not d["loopback"] and d["name"] != "lo"
+    d["toggle_note"] = "" if IS_ROOT else W("Start NetPane with sudo to turn adapters on or off.",
+                                            "Run NetPane as administrator to turn adapters on or off.")
+    return d
+
+
+def nic_toggle(name, action):
+    if action not in ("on", "off"):
+        return {"ok": False, "error": "Action must be on or off."}
+    if name not in _nic_names():
+        return {"ok": False, "error": f"No adapter called {name!r}."}
+    me = next((i for i in interfaces() if i["name"] == name), {})
+    if me.get("loopback") or name == "lo" or (not IS_WIN and read(f"/sys/class/net/{name}/type") == "772"):
+        return {"ok": False, "error": "The loopback adapter can't be turned off. Everything on this computer uses it."}
+    if not IS_ROOT:
+        return {"ok": False, "error": W("Start NetPane with sudo to turn adapters on or off.",
+                                        "Run NetPane as administrator to turn adapters on or off.")}
+    steps = []
+    if IS_WIN:
+        verb = "Enable-NetAdapter" if action == "on" else "Disable-NetAdapter"
+        ps = (f"try{{{verb} -Name '{name.replace(chr(39), chr(39) * 2)}' -Confirm:$false -ErrorAction Stop;"
+              "@{ok=$true}|ConvertTo-Json -Compress}catch{@{ok=$false;err=$_.Exception.Message}|ConvertTo-Json -Compress}")
+        r = powershell(ps, 40) or {"ok": False, "err": "PowerShell gave no answer."}
+        steps.append(f"{verb} -Name '{name}'")
+        if not r.get("ok"):
+            return {"ok": False, "error": str(r.get("err") or "Windows refused the change."), "steps": steps}
+        time.sleep(2)
+        win_snapshot(force=True)
+    else:
+        nm = have("nmcli")
+        if action == "on":
+            rk = None
+            phy = f"/sys/class/net/{name}/phy80211"
+            if os.path.isdir(phy):
+                rk = next((x for x in os.listdir(phy) if x.startswith("rfkill")), None)
+            if rk:
+                if read(f"{phy}/{rk}/hard") == "1":
+                    return {"ok": False, "error": "The Wi-Fi radio is blocked by a hardware switch or Fn key. "
+                                                  "Flip the switch or press the Wi-Fi key, then try again."}
+                if read(f"{phy}/{rk}/soft") == "1":
+                    idx = read(f"{phy}/{rk}/index") or rk[6:]
+                    r = run(["rfkill", "unblock", idx], 5) if have("rfkill") else {"ok": False}
+                    if not r["ok"]:
+                        try:
+                            with open(f"{phy}/{rk}/soft", "w") as f:
+                                f.write("0")
+                        except OSError:
+                            pass
+                    steps.append(f"rfkill unblock {idx}")
+            r = run(["ip", "link", "set", "dev", name, "up"], 10)
+            steps.append(f"ip link set dev {name} up")
+            if not r["ok"]:
+                return {"ok": False, "error": (r["err"] or r["out"]).strip() or "ip link refused.", "steps": steps}
+            if nm:
+                run(["nmcli", "device", "set", name, "managed", "yes"], 8)
+                run(["nmcli", "device", "connect", name], 20)
+                steps.append(f"nmcli device connect {name}")
+        else:
+            if nm:
+                run(["nmcli", "device", "disconnect", name], 15)
+                steps.append(f"nmcli device disconnect {name}")
+            r = run(["ip", "link", "set", "dev", name, "down"], 10)
+            steps.append(f"ip link set dev {name} down")
+            if not r["ok"]:
+                return {"ok": False, "error": (r["err"] or r["out"]).strip() or "ip link refused.", "steps": steps}
+        time.sleep(1.5)
+    now_if = next((i for i in interfaces() if i["name"] == name), {})
+    return {"ok": True, "name": name, "action": action, "steps": steps,
+            "state": now_if.get("state"), "enabled": now_if.get("enabled")}
 
 
 def routes():
@@ -2865,15 +3371,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, scan_host(q.get("ip", "")))
             if u.path == "/api/lookup":
                 return self.send(200, lookup(q.get("kind", ""), q.get("target", "")))
+            if u.path == "/api/nic":
+                return self.send(200, nic_details(q.get("name", "")))
             if u.path == "/api/lldp":
                 return self.send(200, lldp_listen(int(q.get("t", "65") or 65)))
             stamp = dt.datetime.now().strftime("%Y%m%d-%H%M")
             if u.path == "/api/report.txt":
                 return self.send(200, text_report(), "text/plain",
-                                 {"Content-Disposition": f'attachment; filename="netpane-{socket.gethostname()}-{stamp}.txt"'})
+                                 {"Content-Disposition": f'attachment; filename="NetPane-{socket.gethostname()}-{stamp}.txt"'})
             if u.path == "/api/report.json":
                 return self.send(200, json.dumps(json_report(), indent=2, default=str), "application/json",
-                                 {"Content-Disposition": f'attachment; filename="netpane-{socket.gethostname()}-{stamp}.json"'})
+                                 {"Content-Disposition": f'attachment; filename="NetPane-{socket.gethostname()}-{stamp}.json"'})
             self.send(404, {"error": "not found"})
         except Exception as e:  # noqa: BLE001
             self.send(500, {"error": f"{type(e).__name__}: {e}"})
@@ -2895,6 +3403,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
             if self.path == "/api/run":
                 return self.send(200, console(str(body.get("tool", "")), str(body.get("args", ""))))
+            if self.path == "/api/nic":
+                return self.send(200, nic_toggle(str(body.get("name", "")), str(body.get("action", ""))))
             if self.path == "/api/ssh":
                 return self.send(200, ssh_launch(str(body.get("host", "")), str(body.get("user", "")),
                                                  body.get("port", 22)))
@@ -3444,6 +3954,13 @@ canvas{display:block;width:100%}
 .tool.off:hover .get{display:block}.tool.off:hover div div{display:none}.tool.off{color:var(--ink-3)}.tool.off .i{color:var(--ink-3)}
 .tool b{font-family:var(--mono);font-weight:600;font-size:12.5px}
 .tool div div{font-size:12px;color:var(--ink-3)}
+.nicbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:12px 0}
+.btn.danger{color:var(--fail);border-color:var(--fail)}
+.drawer h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-3);margin:18px 0 0}
+.drawer h3+.dl{margin-top:8px}
+.drawer details{margin-top:14px}.drawer summary{cursor:pointer;color:var(--ink-2);font-size:12.5px}
+.buybox{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:10px;background:var(--sunken)}
+.buybox ul{margin:8px 0 0;padding-left:18px;font-size:12.5px}
 pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--ink-2);user-select:text}
 .copy{display:flex;gap:8px;align-items:center;background:var(--sunken);border:1px solid var(--line);border-radius:6px;padding:6px 8px;margin-top:6px}
 .copy code{flex:1;font:12px var(--mono);overflow-x:auto;white-space:nowrap;user-select:text}
@@ -3554,6 +4071,7 @@ pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--
 <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8"/></symbol>
 <symbol id="i-open" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-8 8M18 14v4.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"/></symbol>
 <symbol id="i-keys" viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.01M9.5 10h.01M13 10h.01M16.5 10h.01M7 14h10"/></symbol>
+<symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v8"/><path d="M6.4 6.6a8 8 0 1 0 11.2 0"/></symbol>
 <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 2.8v4.9c0 4.3-3 7.5-7 8.8-4-1.3-7-4.5-7-8.8V5.8z"/><path d="m9 11.8 2 2 4-4"/></symbol>
 </defs></svg>
 
@@ -3642,7 +4160,7 @@ pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--
   <!-- INTERFACES -->
   <section class="view" id="v-interfaces" hidden data-sub="Network adapters, addresses, routing and DNS on this computer.">
    <div class="vtools" data-tools></div>
-   <div class="sheet"><div id="ifaces"><div class="loading">Reading interfaces</div></div></div>
+   <div class="sheet"><div class="shead"><h2>Adapters</h2><span class="hint">Click a Wi-Fi card or network card for its maker, model, driver and hardware IDs, or to turn it on or off.</span></div><div id="ifaces"><div class="loading">Reading interfaces</div></div></div>
    <div class="sheet"><div class="shead"><h2>VLAN &amp; segment</h2><button class="btn sm" id="lldpbtn">Listen for a switch (LLDP/CDP)</button></div><div class="sbody" id="vlan"><div class="loading">Checking for a VLAN tag</div></div></div>
    <div class="split">
     <div class="sheet"><div class="shead"><h2>Routing table</h2></div><div id="routes"></div></div>
@@ -3818,7 +4336,7 @@ function renderIfaces(){const o=S.ov;
  S.rerender.ifaces=renderIfaces;
  $("#ifaces").innerHTML=table([
   {k:"name",label:"Interface",sort:i=>i.name,render:i=>`<div class="dev"><div class="devicon">${ic(i.wireless?"wifi":"port")}</div><div><div class="devname">${esc(i.name)}${i.name===o.primary?'<span class="chip">primary</span>':""}${i.virtual?'<span class="chip">virtual</span>':""}</div><div class="devsub">${esc(i.driver||(i.virtual?"software device":""))}</div></div></div>`},
-  {k:"st",label:"Status",sort:i=>i.carrier!=="0"&&i.state!=="DOWN"?0:1,render:i=>{const up=i.carrier!=="0"&&i.state!=="DOWN";return `<span class="tag ${up?(i.state==="UP"?"ok":"warn"):"fail"}">${up?"Connected":"No link"}</span>`}},
+  {k:"st",label:"Status",sort:i=>i.enabled===false?2:i.carrier!=="0"&&i.state!=="DOWN"?0:1,render:i=>{if(i.enabled===false)return `<span class="tag">Turned off</span>`;const up=i.carrier!=="0"&&i.state!=="DOWN";return `<span class="tag ${up?(i.state==="UP"?"ok":"warn"):"fail"}">${up?"Connected":"No link"}</span>`}},
   {k:"ip",label:"Address",sort:i=>i.ipv4[0]||"~",render:i=>`<div class="mono">${esc(i.ipv4.join(", ")||"none")}</div>${i.ipv6.length?`<div class="mono muted" style="font-size:11px">${esc(short(i.ipv6[0],30))}</div>`:""}`},
   {k:"mac",label:"Hardware address",sort:i=>i.mac,render:i=>`<div class="mono">${esc(i.mac)}</div><div class="devsub">${esc(i.vendor)}</div>`},
   {k:"spd",label:"Speed",r:1,sort:i=>i.speed||0,render:i=>i.wifi&&i.wifi.ssid?`${esc(i.wifi.ssid)}<div class="devsub">${i.wifi.signal_pct!=null?esc(i.wifi.signal_pct)+"%":esc(i.wifi.signal??"?")+" dBm"}, ${esc(i.wifi.bitrate||"")}</div>`:(i.speed?`${i.speed>=1000?i.speed/1000+" Gb/s":i.speed+" Mb/s"}<div class="devsub">${esc(i.duplex||"")} duplex</div>`:'<span class="muted">n/a</span>')},
@@ -3826,7 +4344,8 @@ function renderIfaces(){const o=S.ov;
   {k:"rx",label:"Received",r:1,sort:i=>i.rx_bytes||0,render:i=>bytes(i.rx_bytes)},
   {k:"tx",label:"Sent",r:1,sort:i=>i.tx_bytes||0,render:i=>bytes(i.tx_bytes)},
   {k:"err",label:"Errors",r:1,sort:i=>(i.rx_errors||0)+(i.tx_errors||0),render:i=>{const e=(i.rx_errors||0)+(i.tx_errors||0),d=(i.rx_dropped||0)+(i.tx_dropped||0);return `${e?`<span class="tag fail">${e}</span>`:"0"}${d?`<div class="devsub">${d} dropped</div>`:""}`}}
- ],o.interfaces.filter(i=>!i.loopback),{id:"ifaces",empty:"No network adapters found.",tall:1})}
+ ],o.interfaces.filter(i=>!i.loopback),{id:"ifaces",empty:"No network adapters found.",tall:1,
+  row:i=>` class="click" tabindex="0" data-nic="${esc(i.name)}" data-menu="nic" data-name="${esc(i.name)}" data-mac="${esc(i.mac||"")}" data-on="${i.enabled===false?"0":"1"}"`})}
 function renderRoutes(){const o=S.ov;if(!o)return;const d=o.dns;S.rerender.routes=renderRoutes;
  $("#routes").innerHTML=table([{k:"d",label:"Destination",sort:r=>r.dst==="default"?"":r.dst,render:r=>`<span class="mono">${esc(r.dst==="default"?"Everything else (default)":r.dst)}</span>`},{k:"g",label:"Via",sort:r=>r.gateway||"",render:r=>`<span class="mono">${esc(r.gateway||"Direct")}</span>`},{k:"i",label:"Interface",sort:r=>r.dev||"",render:r=>esc(r.dev||"")},{k:"m",label:"Metric",r:1,sort:r=>+r.metric||0,render:r=>esc(r.metric??"")}],o.routes.ipv4,{id:"routes",empty:"No routes. This computer can't reach any network.",tall:1});
  $("#dns").innerHTML=`<dl class="dl" style="margin:0"><dt>Servers</dt><dd class="mono">${esc(d.resolv_conf.join(", ")||"None configured")}${d.stub?' <span class="chip">local cache</span>':""}</dd>
@@ -3945,8 +4464,48 @@ async function hostAction(ip,act,b){const out=$("#hout");if(out)out.textContent=
   else if(act==="ping")t=await runTool("ping",S.ov?.platform==="windows"?`-n 4 ${ip}`:`-c 4 ${ip}`);
   else{const has=c=>(S.tools||[]).find(x=>x.cmd===c&&x.installed);t=await runTool(has("mtr")?"mtr":has("tracert")?"tracert":"traceroute",has("tracert")?`-d ${ip}`:`-n ${ip}`)}
   if(out)out.textContent=t}catch(e){if(out)out.textContent=e.message}if(b)b.disabled=false}
+/* ---------- adapter (NIC / WIC) details and on/off ---------- */
+async function showNic(name){S.nic=name;
+ openDrawer(`<div class="dtop"><div class="devicon">${ic("port")}</div><div><h2>${esc(name)}</h2><div class="muted">Reading hardware details</div></div><button class="btn icon x" data-close aria-label="Close">${ic("x")}</button></div><div class="loading">Asking the driver and the hardware database</div>`);
+ try{const d=await api("/api/nic?name="+encodeURIComponent(name));if(S.nic!==name)return;S.nicData=d;renderNic(d)}
+ catch(e){if(S.nic===name)$("#drawer").innerHTML=`<div class="dtop"><h2>${esc(name)}</h2><button class="btn icon x" data-close aria-label="Close">${ic("x")}</button></div><div class="note fail">${ic("alert")}<div>${esc(e.message)}</div></div>`}}
+function nicRows(pairs){const r=pairs.filter(p=>p[1]!=null&&p[1]!==""&&!(Array.isArray(p[1])&&!p[1].length));
+ return r.length?`<dl class="dl">${r.map(([k,v,mono])=>`<dt>${esc(k)}</dt><dd${mono?' class="mono"':""}>${esc(Array.isArray(v)?v.join(", "):v)}</dd>`).join("")}</dl>`:`<div class="soft" style="margin:8px 0">Nothing reported.</div>`}
+function renderNic(d){const hw=d.hardware||{},dr=d.driver||{},c=d.capabilities||{},rp=d.replacement||{},o=S.ov||{};
+ const kind=d.wireless?"Wi-Fi card":d.loopback?"Loopback":d.virtual?"Software adapter":"Network card";
+ const on=d.enabled!==false,up=on&&d.carrier!=="0"&&d.state!=="DOWN";
+ const st=!on?`<span class="tag">Turned off</span>`:up?`<span class="tag ok">Connected</span>`:`<span class="tag fail">No link</span>`;
+ const primary=o.primary===d.name;
+ const wifi=(o.interfaces||[]).find(i=>i.name===d.name)?.wifi;
+ const macRow=d.permanent_mac&&d.permanent_mac!==d.mac?[["Current MAC",d.mac,1],["Burned-in MAC",d.permanent_mac,1],["Burned-in MAC maker",d.permanent_mac_vendor]]:[["MAC address",d.mac,1],["MAC maker (OUI)",d.mac_vendor||(d.permanent_mac_vendor||"")]];
+ let x=`<div class="dtop"><div class="devicon">${ic(d.wireless?"wifi":"port")}</div><div><h2>${esc(d.name)}${primary?'<span class="chip">primary</span>':""}</h2><div class="muted">${esc(hw.description||kind)}</div></div><button class="btn icon x" data-close aria-label="Close">${ic("x")}</button></div>
+ <div class="nicbar">${st}<span class="chip" style="margin:0">${esc(kind)}</span><span style="flex:1"></span>
+  ${d.loopback||d.name==="lo"?"":`<button class="btn ${on?"danger":"primary"}" id="nictog"${d.can_toggle?"":" disabled"}>${ic("power")}${on?"Turn off":"Turn on"}</button>`}</div>
+ ${d.toggle_note&&!d.loopback?`<div class="note info" style="margin:0 0 6px">${ic("info")}<div>${esc(d.toggle_note)}</div></div>`:""}
+ <div id="nicmsg"></div>
+ <h3>Adapter</h3>${nicRows([...macRow,["MAC note",d.mac_note?`This adapter is using a ${d.mac_note} MAC, not the one burned into the card.`:""],["IPv4",d.ipv4,1],["IPv6",d.ipv6,1],["MTU",d.mtu],
+  ...(wifi&&wifi.ssid?[["Connected to",wifi.ssid],["Signal",wifi.signal_pct!=null?wifi.signal_pct+"%":wifi.signal!=null?wifi.signal+" dBm":""],["Link rate",wifi.bitrate]]:[])])}
+ <h3>Hardware</h3>${nicRows([["Chip maker",hw.chip_vendor],["Chip model",hw.chip_model],["Card made by",hw.card_vendor],["Card model",hw.card_model],["Hardware ID",hw.hardware_id,1],["Connection",hw.bus],["Slot / location",hw.location,1],["Revision",hw.revision],["Serial number",hw.serial,1],["Device ID",hw.device_id,1],["Predictable name",hw.predictable_name,1]])}
+ <h3>Driver</h3>${nicRows([["Driver",dr.name,1],["Version",dr.version,1],["Firmware",dr.firmware,1],["Provider",dr.provider],["Date",dr.date]])}
+ <h3>Capabilities</h3>${nicRows(d.wireless?[["Generation",c.generation],["Standards",c.standards],["Bands",c.bands],["Antennas",c.streams],["Radio",c.radio_switch],["Mode now",c.mode],["Channel now",c.channel],["Transmit power",c.tx_power],["Supported modes",c.modes],["Wireless mode setting",c["Wireless Mode"]||c["802.11n/ac/ax Wireless Mode"]],["Preferred band",c["Preferred Band"]]]
+   :[["Max link speed",c.max_speed],["Speed now",c.current_speed],["Duplex now",c.current_duplex],["Speed setting",c.speed_setting],["Port",c.port],["Auto-negotiation",c.autoneg],["Link detected",c.link_detected],["Supported modes",c.link_modes],["Wake-on-LAN",c.wake_on_lan||c["Wake on Magic Packet"]],["Media",c.media]])}
+ ${d.virtual||d.loopback?"":`<h3>Buying a replacement</h3><div class="buybox"><pre class="plain">${esc(rp.spec||"")}</pre>${(rp.tips||[]).length?`<ul>${rp.tips.map(t=>`<li>${esc(t)}</li>`).join("")}</ul>`:""}
+  <div class="crow" style="margin-top:10px"><button class="btn" id="niccopy">${ic("copy")}Copy all details</button>${rp.search?`<button class="btn" data-copy="${esc(rp.search)}" data-copy-label="search term">${ic("search")}Copy search term</button>`:""}</div></div>`}
+ ${Object.keys(d.raw||{}).length?`<details><summary>Raw output from the tools</summary>${Object.entries(d.raw).map(([k,v])=>`<div class="soft" style="margin:10px 0 4px">${esc(k)}</div><pre class="plain">${esc(v)}</pre>`).join("")}</details>`:""}`;
+ $("#drawer").innerHTML=x;
+ const cb=$("#niccopy");if(cb)cb.onclick=()=>copy(rp.spec,"adapter details");
+ const t=$("#nictog");if(t)t.onclick=()=>nicToggle(d.name,on?"off":"on",t)}
+async function nicToggle(name,action,btn){const msg=$("#nicmsg"),o=S.ov||{};
+ if(action==="off"&&btn&&btn.dataset.armed!=="1"){btn.dataset.armed="1";btn.innerHTML=ic("power")+"Click again to turn off";
+  if(msg)msg.innerHTML=`<div class="note${o.primary===name?" fail":""}" style="margin:0 0 6px">${ic("alert")}<div>${o.primary===name?`<b>${esc(name)} is the adapter this computer uses for the internet.</b> Turning it off cuts the connection until you turn it back on. NetPane keeps working, since it runs on this computer.`:`Turning off <b>${esc(name)}</b> stops all traffic on it until you turn it back on here.`}</div></div>`;
+  setTimeout(()=>{if(btn.isConnected&&btn.dataset.armed==="1"){btn.dataset.armed="";btn.innerHTML=ic("power")+"Turn off";if(msg)msg.innerHTML=""}},6000);return}
+ if(btn){btn.disabled=true;btn.innerHTML=ic("power")+(action==="on"?"Turning on…":"Turning off…")}
+ try{const r=await api("/api/nic",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,action})});
+  if(r.ok){toast(`${name} turned ${action}`,"ok");await loadOverview();if(S.nic===name&&!$("#scrim").hidden)showNic(name);if(action==="on")setTimeout(()=>{loadOverview();loadHealth()},6000)}
+  else{if(msg)msg.innerHTML=`<div class="note fail" style="margin:0 0 6px">${ic("alert")}<div>${esc(r.error||"The change was refused.")}</div></div>`;if(btn){btn.disabled=false;btn.innerHTML=ic("power")+(action==="on"?"Turn on":"Turn off");btn.dataset.armed=""}}}
+ catch(e){if(msg)msg.innerHTML=`<div class="note fail" style="margin:0 0 6px">${ic("alert")}<div>${esc(e.message)}</div></div>`;if(btn)btn.disabled=false}}
 function openDrawer(html){$("#drawer").innerHTML=html;$("#scrim").hidden=false;const x=$("#drawer [data-close]");if(x)x.focus()}
-function closeDrawer(){$("#scrim").hidden=true;S.drawerApp=null}
+function closeDrawer(){$("#scrim").hidden=true;S.drawerApp=null;S.nic=null}
 $("#scrim").onclick=e=>{if(e.target.id==="scrim")closeDrawer()};
 
 /* ---------- topology ---------- */
@@ -4322,6 +4881,7 @@ function drawChart(){const c=$("#tchart");if(!c||!c.clientWidth)return;const d=(
 function ctxItems(el){const m=el.dataset.menu,ip=el.dataset.ip,mac=el.dataset.mac,name=el.dataset.name,pids=el.dataset.pids,port=el.dataset.port,items=[];
  if(m==="device"){items.push(["open","Show details",()=>showHost(ip)],["play","Ping",()=>{showHost(ip);hostAction(ip,"ping")}],["search","Scan ports",()=>{showHost(ip);hostAction(ip,"scan")}],["path","Trace path to here",()=>{go("path");loadPath(ip)}],"-",["copy","Copy IP address",()=>copy(ip,"IP address")]);if(mac)items.push(["copy","Copy hardware address",()=>copy(mac,"hardware address")]);if(name)items.push(["copy","Copy name",()=>copy(name,"name")])}
  else if(m==="app"){if(el.dataset.app)items.push(["open","Show connections",()=>showApp(el.dataset.app)]);items.push(["copy",pids.includes(" ")?"Copy PIDs":"Copy PID",()=>copy(pids,pids.includes(" ")?"PIDs":"PID "+pids)],["copy","Copy name",()=>copy(name,"name")]);if(port)items.push(["copy","Copy port",()=>copy(port,"port "+port)]);items.push("-",["search","Filter Apps by this",()=>{go("apps");$("#afilter").value=name;renderApps()}])}
+ else if(m==="nic"){const off=el.dataset.on==="0";items.push(["open","Show hardware details",()=>showNic(name)],["power",off?"Turn on":"Turn off",()=>{showNic(name).then(()=>{const b=$("#nictog");if(b&&!b.disabled)nicToggle(name,off?"on":"off",b)})}],"-");if(mac)items.push(["copy","Copy MAC address",()=>copy(mac,"MAC address")]);items.push(["copy","Copy name",()=>copy(name,"name")])}
  else if(m==="hop"||m==="sock"){if(ip)items.push(["path","Trace path to here",()=>{closeDrawer();go("path");loadPath(ip)}],["copy","Copy address",()=>copy(ip,"address")]);if(name)items.push(["copy","Copy name",()=>copy(name,"name")])}
  return items}
 function openCtx(el,x,y){const items=ctxItems(el);if(!items.length)return;const m=$("#ctx");S.ctxFns=[];
@@ -4338,6 +4898,7 @@ document.addEventListener("click",e=>{
  const cl=e.target.closest("[data-close]");if(cl){closeDrawer();return}
  const cp=e.target.closest("[data-copy]");if(cp){copy(cp.dataset.copy,cp.dataset.copyLabel);return}
  const ap=e.target.closest("[data-app]");if(ap){showApp(ap.dataset.app);return}
+ const nb=e.target.closest("[data-nic]");if(nb){showNic(nb.dataset.nic);return}
  const hb=e.target.closest("[data-host]");if(hb){showHost(hb.dataset.host);return}
  const sn=e.target.closest("[data-stage]");if(sn){const g=$("#g-"+sn.dataset.stage);if(g){g.scrollIntoView({behavior:"smooth",block:"center"});g.classList.remove("flash");void g.offsetWidth;g.classList.add("flash")}return}
  const gb=e.target.closest("[data-group]");if(gb){S.group=gb.dataset.group;$$("[data-group]").forEach(b=>b.setAttribute("aria-pressed",b===gb));renderApps();return}
