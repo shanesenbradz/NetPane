@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 EXE = sys.argv[1]
@@ -33,7 +34,7 @@ def check(cond, label, detail=""):
         failures.append(label)
 
 
-log = open("netpane-smoke.log", "w")
+log = open("NetPane-smoke.log", "w")
 proc = subprocess.Popen([EXE, "--no-browser", "--port", "8765"], stdout=log, stderr=subprocess.STDOUT)
 try:
     for _ in range(90):
@@ -57,6 +58,15 @@ try:
     check(bool(o["gateway"]), "default gateway found from Get-NetRoute")
     check(bool(o["dns"]["resolv_conf"]), "DNS servers found from Get-DnsClientServerAddress", o["dns"]["resolv_conf"])
     check(o["primary"] is not None, "primary interface chosen", o["primary"])
+
+    print("\n== adapter details")
+    nd = get("/api/nic?name=" + urllib.parse.quote(o["primary"]))
+    print("   ", nd.get("hardware"), nd.get("driver"))
+    check(not nd.get("error") and nd.get("name") == o["primary"], "adapter details answer for the primary NIC")
+    check(bool(nd.get("hardware", {}).get("description")), "adapter maker and model found", nd.get("hardware", {}).get("description"))
+    check(bool(nd.get("replacement", {}).get("spec")), "replacement spec built")
+    r = post("/api/nic", {"name": "no such adapter", "action": "off"})
+    check(r.get("ok") is False, "turning off an unknown adapter is refused")
 
     print("\n== health")
     h = get("/api/health")
@@ -124,7 +134,7 @@ finally:
     subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
     log.close()
     print("\n== NetPane console output")
-    print(open("netpane-smoke.log", errors="replace").read()[-3000:])
+    print(open("NetPane-smoke.log", errors="replace").read()[-3000:])
 
 print(f"\n{len(failures)} failure(s)" + (": " + ", ".join(failures) if failures else ""))
 sys.exit(1 if failures else 0)

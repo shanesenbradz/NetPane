@@ -26,9 +26,9 @@ jobs:
       - name: Build NetPane.exe
         run: >
           pyinstaller --onefile --console --name NetPane
-          --icon packaging/netpane.ico
+          --icon packaging/NetPane.ico
           --version-file packaging/version.txt
-          netpane.py
+          NetPane.py
 
       - name: Test the exe on Windows
         run: python packaging/smoke_test.py dist/NetPane.exe
